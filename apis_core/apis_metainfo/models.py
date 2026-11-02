@@ -1,11 +1,18 @@
 import re
+import time
 import unicodedata
 from datetime import date, datetime
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
 
-from acdh_wikidata_pyutils import fetch_image
-from AcdhArcheAssets.uri_norm_rules import get_normalized_uri
+import requests
+from acdh_wikidata_pyutils import (
+    DEFAULT_REQUEST_HEADERS,
+    IMG_EP,
+    JSON_API_STUB,
+    URL_STUB,
+)
+from AcdhArcheAssets.uri_norm_rules import get_norm_id, get_normalized_uri
 from django.apps import apps
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
@@ -50,6 +57,53 @@ WIKIMEDIA_ORIGINAL_PATTERN = re.compile(
 WIKIMEDIA_THUMB_WIDTH = 250
 
 
+def pick_wikidata_image_name(claims):
+    """Returns the file name of the image to use from the P18 statements of a
+    wikidata item: the first one with rank "preferred", otherwise the first one
+    that is not "deprecated". Returns None if there is no such statement."""
+    candidates = []
+    for statement in claims:
+        if statement.get("rank") == "deprecated":
+            continue
+        try:
+            name = statement["mainsnak"]["datavalue"]["value"]
+        except KeyError:
+            continue
+        candidates.append((statement.get("rank") != "preferred", name))
+    if not candidates:
+        return None
+    return min(candidates, key=lambda x: x[0])[1]
+
+
+def get_json_with_retry(url, attempts=3):
+    """GETs a JSON document, waits and retries if Wikidata/Commons answer with
+    "too many requests" or a server error, raises for any other bad status."""
+    for attempt in range(attempts):
+        r = requests.get(url, headers=DEFAULT_REQUEST_HEADERS, timeout=30)
+        if r.status_code in (429, 500, 502, 503, 504) and attempt < attempts - 1:
+            time.sleep(min(int(r.headers.get("Retry-After", 2 ** (attempt + 1))), 30))
+            continue
+        r.raise_for_status()
+        return r.json()
+
+
+def fetch_image(wikidata_uri, thumb_width=WIKIMEDIA_THUMB_WIDTH):
+    """Returns the URL of a thumbnail of the image (P18) of a wikidata item,
+    respecting the rank of the statements, or an empty string."""
+    wikidata_id = get_norm_id(wikidata_uri) if "/" in wikidata_uri else wikidata_uri
+    claims = get_json_with_retry(IMG_EP.format(wikidata_id))
+    img_name = pick_wikidata_image_name(claims.get("claims", {}).get("P18", []))
+    if img_name is None:
+        return ""
+    img = URL_STUB.format(quote(img_name))
+    api_url = JSON_API_STUB.format(img.split("file/")[-1], thumb_width)
+    data = get_json_with_retry(api_url)
+    try:
+        return next(iter(data["query"]["pages"].values()))["imageinfo"][0]["thumburl"]
+    except KeyError, IndexError:
+        return img
+
+
 def normalize_wikimedia_img_url(url):
     """Turns the URL of an original Wikimedia file
     (https://upload.wikimedia.org/wikipedia/commons/d/da/Otto_Brahm.jpg?utm_source=…)
@@ -60,6 +114,13 @@ def normalize_wikimedia_img_url(url):
     if not url:
         return url
     parts = urlsplit(url.strip())
+    if parts.netloc == "commons.wikimedia.org" and parts.path.startswith(
+        "/wiki/Special:FilePath/"
+    ):
+        # FilePath redirects to the file; width makes it redirect to a thumbnail
+        return (
+            f"{parts.scheme}://{parts.netloc}{parts.path}?width={WIKIMEDIA_THUMB_WIDTH}"
+        )
     if parts.netloc != "upload.wikimedia.org":
         return url
     base = f"{parts.scheme}://{parts.netloc}{parts.path}"
@@ -167,7 +228,7 @@ class TempEntityClass(models.Model):
     img_url = models.URLField(
         blank=True,
         null=True,
-        max_length=300,
+        max_length=600,
         verbose_name="Bild URL",
         help_text="URL zu einem Bild der Entität",
     )
@@ -255,7 +316,7 @@ class TempEntityClass(models.Model):
             img_url = fetch_image(wikidata_uri.uri)
             self.img_last_checked = datetime.now(tz=tz)
             if img_url:  # noqa: SIM102
-                if len(img_url) < 301:
+                if len(img_url) < 601:
                     self.img_url = img_url
                     print(self.id, img_url)
             self.save()
@@ -263,7 +324,7 @@ class TempEntityClass(models.Model):
             self.img_last_checked = datetime.now(tz=tz)
             img_url = fetch_image(wikidata_uri.uri)
             if img_url:  # noqa: SIM102
-                if len(img_url) < 301:
+                if len(img_url) < 601:
                     self.img_url = img_url
             self.save()
         return self
