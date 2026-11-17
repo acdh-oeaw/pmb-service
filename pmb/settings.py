@@ -379,6 +379,8 @@ DOMAIN_MAPPING = [
     ("https://www.dla-marbach.de/", "dla-marbach", "#C96E22"),
     ("tillich-briefe", "tillich-briefe", "#9B5F98"),
     ("semantickraus", "semantickraus", "#9B5F98"),
+    ("burgtheater", "burgtheater", "#02305c"),
+    ("spielplan-oper_1869–1945", "spielplan-oper_1869–1945", "#337ab7a"),
 ]
 
 # projects delivering a pmb_uris-in-use.csv, see `manage.py sync_uris_in_use`;
