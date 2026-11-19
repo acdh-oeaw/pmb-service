@@ -10,9 +10,11 @@ from django.test import Client, SimpleTestCase, TestCase
 from django.test.utils import CaptureQueriesContext
 from django.urls import reverse
 
+from apis_core.apis_entities.list_view_uris import UriTable
 from apis_core.apis_entities.models import Event, Institution, Person, Place, Work
 from apis_core.apis_metainfo.models import (
     Collection,
+    TempEntityClass,
     Uri,
     fetch_image,
     normalize_wikimedia_img_url,
@@ -306,3 +308,22 @@ class UriListViewTestCase(TestCase):
         )
         self.assertNotContains(response, '<input type="hidden" name="page"')
         self.assertNotContains(response, '<option value="?')
+
+    def test_shows_entity_type_column(self):
+        response = self.client.get(self.url, {"domain": "pmb", "columns": "ent_type"})
+        self.assertEqual(response.status_code, 200)
+        ent_types = {
+            row.get_cell("ent_type") for row in response.context["table"].rows
+        }
+        self.assertEqual(
+            ent_types, {"Person", "Place", "Institution", "Event", "Work"}
+        )
+
+    def test_entity_without_child_is_plain_text(self):
+        # a bare TempEntityClass has no Person/Place/… behind it
+        orphan = TempEntityClass.objects.create(name="Waise")
+        uri = Uri.objects.create(uri="https://example.org/orphan", entity=orphan)
+        table = UriTable([uri])
+        self.assertEqual(table.render_entity(orphan), str(orphan))
+        self.assertEqual(table.render_ent_type(uri), "")
+
