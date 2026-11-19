@@ -8,7 +8,12 @@ from django.utils import timezone
 from apis_core.apis_entities.models import Person, Place
 from apis_core.apis_labels.models import Label
 from apis_core.apis_metainfo.errors import MergeUndoError
-from apis_core.apis_metainfo.models import Collection, MergeLog, Uri
+from apis_core.apis_metainfo.models import (
+    Collection,
+    MergeLog,
+    TempEntityClass,
+    Uri,
+)
 from apis_core.apis_relations.models import PersonPerson, PersonPlace
 from apis_core.apis_vocabularies.models import (
     PersonPersonRelation,
@@ -197,3 +202,86 @@ class MergeUndoTestCase(TestCase):
         self.client.post(url, {"entity": self.target.pk})
         log = MergeLog.objects.get(source_pk=self.source_pk)
         self.assertEqual(log.user, self.user)
+
+    def test_str(self):
+        log = self.merge()
+        self.assertEqual(
+            str(log), f"{log.source_name} ({self.source_pk}) -> {self.target.pk}"
+        )
+
+    def test_undo_restores_relation_with_source_on_side_a(self):
+        rel = PersonPerson.objects.create(
+            related_persona=self.source,
+            related_personb=self.other,
+            relation_type=self.rel_pp.relation_type,
+        )
+        log = self.merge()
+        rel.refresh_from_db()
+        self.assertEqual(rel.related_persona_id, self.target.pk)
+        self.assertEqual(log.undo(), [])
+        rel.refresh_from_db()
+        self.assertEqual(rel.related_persona_id, self.source_pk)
+
+    def test_undo_warns_about_uris_and_labels_moved_away(self):
+        log = self.merge()
+        self.gnd.entity = self.other
+        self.gnd.save()
+        self.label.temp_entity = self.other
+        self.label.save()
+        warnings = log.undo()
+        self.assertEqual(len(warnings), 2)
+        self.assertIn("URI", warnings[0])
+        self.assertIn("Label", warnings[1])
+        self.gnd.refresh_from_db()
+        self.assertEqual(self.gnd.entity_id, self.other.pk)
+
+    def test_undo_blocked_when_target_deleted(self):
+        log = self.merge()
+        self.target.delete()
+        self.assertEqual(log.undo_blocker(), "Die Ziel-Entität existiert nicht mehr.")
+        with self.assertRaises(MergeUndoError):
+            log.undo()
+
+    def test_undo_blocked_when_source_id_taken(self):
+        log = self.merge()
+        TempEntityClass.objects.create(pk=self.source_pk, name="Platzhalter")
+        self.assertIn(str(self.source_pk), log.undo_blocker())
+        self.assertFalse(log.can_undo)
+
+    def test_undo_without_target_changes_keeps_later_edits(self):
+        # a bare source changes none of the tracked target fields
+        bare = Person.objects.create(name="Bahr", first_name="H.")
+        bare_pk = bare.pk
+        self.target.merge_with(bare_pk, user=self.user)
+        log = MergeLog.objects.get(source_pk=bare_pk)
+        self.target.refresh_from_db()
+        self.target.references = "added after merge"
+        self.target.save()
+        self.assertEqual(log.undo(), [])
+        self.assertTrue(Person.objects.filter(pk=bare_pk).exists())
+        self.assertEqual(
+            Person.objects.get(pk=self.target.pk).references, "added after merge"
+        )
+
+    def test_undo_view_shows_error(self):
+        log = self.merge()
+        log.undo()
+        url = reverse("apis:apis_entities:undo_merge_view", kwargs={"pk": log.pk})
+        r = self.client.post(url)
+        self.assertRedirects(
+            r,
+            reverse(
+                "apis:apis_entities:generic_entities_edit_view",
+                kwargs={"entity": "person", "pk": self.target.pk},
+            ),
+            fetch_redirect_response=False,
+        )
+        r = self.client.get(r.url)
+        self.assertContains(r, "bereits rückgängig gemacht")
+
+    def test_undo_view_shows_warnings(self):
+        log = self.merge()
+        self.rel_pl.delete()
+        url = reverse("apis:apis_entities:undo_merge_view", kwargs={"pk": log.pk})
+        r = self.client.post(url, follow=True)
+        self.assertContains(r, "nicht zurückverschoben")
