@@ -182,6 +182,51 @@ class InverseRelationTypeTestCase(TestCase):
             filtered, [{"id": f"{self.parent_type.pk}:r", "text": "ist Kind von"}]
         )
 
+    def test_clean_accepts_type_without_canonical_inverse(self):
+        self.child_type.clean()
+
+    def test_clean_rejects_target_from_other_vocabulary(self):
+        from apis_core.apis_vocabularies.models import PersonPlaceRelation
+
+        lives = PersonPlaceRelation.objects.create(name="wohnt in")
+        self.child_type.canonical_inverse = lives
+        with self.assertRaisesMessage(ValidationError, "demselben Vokabular"):
+            self.child_type.clean()
+
+    def test_clean_rejects_deprecating_a_canonical_type(self):
+        self.deprecate_child_type()
+        self.parent_type.canonical_inverse = self.sibling_type
+        with self.assertRaisesMessage(ValidationError, "Andere Typen verweisen"):
+            self.parent_type.clean()
+
+    def test_autocomplete_rejects_unknown_direction(self):
+        from django.urls import reverse
+
+        url = reverse(
+            "apis:apis_vocabularies:generic_vocabularies_autocomplete",
+            args=["personpersonrelation", "sideways"],
+        )
+        self.assertEqual(self.client.get(url).status_code, 404)
+
+    def test_relation_form_hides_deprecated_types_except_current(self):
+        from apis_core.apis_relations.models import PersonPerson
+        from apis_core.apis_relations.utils import generate_relation_form
+
+        rel = PersonPerson.objects.create(
+            related_persona=self.child,
+            related_personb=self.parent,
+            relation_type=self.child_type,
+        )
+        self.deprecate_child_type()
+        form_class = generate_relation_form(PersonPerson)
+
+        offered = form_class().fields["relation_type"].queryset
+        self.assertIn(self.parent_type, offered)
+        self.assertNotIn(self.child_type, offered)
+        # an existing relation still shows its (deprecated) type
+        offered = form_class(instance=rel).fields["relation_type"].queryset
+        self.assertIn(self.child_type, offered)
+
     def relation_form_data(self, relation_type, target):
         return {
             "relation_type": relation_type,
@@ -351,3 +396,97 @@ class NormalizeInverseRelationsCommandTestCase(TestCase):
         out = self.run_command("--report")
         self.assertIn("'ist Elternteil von' (0)", out)
         self.assertIn("'ist Kind von' (1)", out)
+
+    def mark(self):
+        return f"{self.child_type.pk}:{self.parent_type.pk}"
+
+    def test_requires_marks(self):
+        from django.core.management.base import CommandError
+
+        with self.assertRaisesMessage(CommandError, "No relation type is marked"):
+            self.run_command()
+
+    def test_rejects_invalid_marks(self):
+        from django.core.management.base import CommandError
+
+        from apis_core.apis_vocabularies.models import PersonPlaceRelation
+
+        lives = PersonPlaceRelation.objects.create(name="wohnt in")
+        cases = {
+            "1120-1109": "Invalid --mark",
+            f"{lives.pk}:{self.parent_type.pk}": "not a relation type between entities",
+            f"{self.child_type.pk}:999999": "Unknown relation type",
+            f"{self.child_type.pk}:{self.child_type.pk}": "eigene Umkehrung",
+        }
+        for mark, message in cases.items():
+            with (
+                self.subTest(mark=mark),
+                self.assertRaisesMessage(CommandError, message),
+            ):
+                self.run_command("--mark", mark)
+
+    def test_warns_if_names_do_not_match(self):
+        from io import StringIO
+
+        from django.core.management import call_command
+
+        from apis_core.apis_vocabularies.models import PersonPersonRelation
+
+        teacher = PersonPersonRelation.objects.create(
+            name="ist Lehrer von", name_reverse="ist Schüler von"
+        )
+        pupil = PersonPersonRelation.objects.create(
+            name="ist Schülerin von", name_reverse="ist Lehrer von"
+        )
+        err = StringIO()
+        call_command(
+            "normalize_inverse_relations",
+            "--mark",
+            f"{pupil.pk}:{teacher.pk}",
+            stdout=StringIO(),
+            stderr=err,
+        )
+        self.assertIn("warning: 'ist Schülerin von'", err.getvalue())
+
+    def test_dry_run_writes_csv_with_merges_and_self_relations(self):
+        import csv
+        import os
+        import tempfile
+
+        from apis_core.apis_relations.models import PersonPerson
+
+        self.create(2, 3, self.parent_type)
+        merged = self.create(3, 2, self.child_type)
+        self.create(1, 1, self.child_type)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "log.csv")
+            out = self.run_command("--mark", self.mark(), "--csv", path)
+            with open(path, encoding="utf-8") as f:
+                rows = list(csv.DictReader(f))
+        self.assertIn(f"log written to {path}", out)
+        self.assertEqual(
+            sorted((row["action"], row["details"]) for row in rows),
+            [("flip", "self-relation"), ("merge", "")],
+        )
+        # dry run: the duplicate is still there
+        self.assertTrue(PersonPerson.objects.filter(pk=merged.pk).exists())
+
+    def test_merge_takes_over_source(self):
+        from apis_core.apis_metainfo.models import Source
+
+        source = Source.objects.create(orig_filename="Taufbuch.pdf")
+        kept = self.create(2, 3, self.parent_type)
+        self.create(3, 2, self.child_type, source=source)
+        self.run_command("--mark", self.mark(), "--apply")
+        kept.refresh_from_db()
+        self.assertEqual(kept.source, source)
+
+    def test_report_lists_marked_types(self):
+        self.child_type.canonical_inverse = self.parent_type
+        self.child_type.save()
+        out = self.run_command("--report")
+        self.assertIn(
+            f"marked: {self.child_type.pk} 'ist Kind von' (0) -> "
+            f"{self.parent_type.pk} 'ist Elternteil von'",
+            out,
+        )
