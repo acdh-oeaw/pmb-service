@@ -7,7 +7,7 @@ from django.core.management.base import CommandError
 from django.test import TestCase, override_settings
 
 from apis_core.apis_entities.models import Event, Institution, Person, Place, Work
-from apis_core.apis_metainfo.models import Uri
+from apis_core.apis_metainfo.models import Collection, Uri
 from dumper.uri_sync import UriSyncError, load_csv
 
 DOMAIN = "mein-projekt"
@@ -255,6 +255,82 @@ class SyncUrisInUseTestCase(TestCase):
         ):
             call_command("sync_uris_in_use", stdout=StringIO(), stderr=StringIO())
         self.assertEqual(self.project_uris().count(), len(self.entities()))
+
+    def member_ids(self, col):
+        return set(col.tempentityclass_set.values_list("pk", flat=True))
+
+    def all_ids(self):
+        return {e.pk for _, e in self.entities()}
+
+    def test_16_live_collection_follows_the_uris(self):
+        live = Collection.objects.create(
+            name="live", related_domain=[DOMAIN], live=True
+        )
+        static = Collection.objects.create(name="static", related_domain=[DOMAIN])
+        manual = Person.objects.create(name="manually added")
+        manual.collection.add(live, static)
+
+        out = self.sync_all()
+        self.assertIn(
+            f"live collection 'live' (id {live.pk}): {len(self.entities())} added, "
+            "1 removed",
+            out,
+        )
+        self.assertEqual(self.member_ids(live), self.all_ids())
+        self.assertEqual(self.member_ids(static), {manual.pk})
+        # entities keep their other collections
+        self.assertEqual(list(manual.collection.all()), [static])
+
+        out = self.sync_all()
+        self.assertIn("0 added, 0 removed", out)
+        self.assertEqual(self.member_ids(live), self.all_ids())
+
+    def test_17_live_collection_loses_entities_without_uri(self):
+        live = Collection.objects.create(
+            name="live", related_domain=[DOMAIN], live=True
+        )
+        self.sync_all()
+        rows = csv_rows(self.entities())
+        gone = rows.pop(0)
+        changed = rows.pop(0)
+        rows.append((changed[0], "person", "https://mein-projekt.example/neu", DOMAIN))
+        out = self.sync(csv_text(rows))
+        self.assertIn("0 added, 1 removed", out)
+        self.assertEqual(self.member_ids(live), self.all_ids() - {gone[0]})
+
+    def test_18_live_collection_with_several_domains(self):
+        live = Collection.objects.create(
+            name="live", related_domain=[DOMAIN, "anders"], live=True
+        )
+        other = Person.objects.create(name="only in anders")
+        Uri.objects.create(
+            uri="https://anders.example/1", domain="anders", entity=other
+        )
+        self.sync_all()
+        self.assertEqual(self.member_ids(live), self.all_ids() | {other.pk})
+
+    def test_19_collection_of_another_domain_is_not_touched(self):
+        other = Collection.objects.create(
+            name="other", related_domain=["anders"], live=True
+        )
+        manual = Person.objects.create(name="manually added")
+        manual.collection.add(other)
+        out = self.sync_all()
+        self.assertNotIn("live collection", out)
+        self.assertEqual(self.member_ids(other), {manual.pk})
+
+    def test_20_dry_run_and_emergency_brake_keep_the_collection(self):
+        live = Collection.objects.create(
+            name="live", related_domain=[DOMAIN], live=True
+        )
+        out = self.sync_all_dry()
+        self.assertIn(f"{len(self.entities())} added, 0 removed", out)
+        self.assertEqual(self.member_ids(live), set())
+
+        self.sync_all()
+        with self.assertRaises(CommandError):
+            self.sync(csv_text(csv_rows(self.entities())[:20]))
+        self.assertEqual(self.member_ids(live), self.all_ids())
 
 
 class LoadCsvTestCase(TestCase):
