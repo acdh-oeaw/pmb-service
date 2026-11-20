@@ -8,7 +8,7 @@ from django.test import TestCase, override_settings
 
 from apis_core.apis_entities.models import Event, Institution, Person, Place, Work
 from apis_core.apis_metainfo.models import Collection, Uri
-from dumper.uri_sync import UriSyncError, load_csv
+from dumper.uri_sync import UriSyncError, build_plan, load_csv
 
 DOMAIN = "mein-projekt"
 URL = "https://mein-projekt.example/pmb_uris-in-use.csv"
@@ -331,6 +331,17 @@ class SyncUrisInUseTestCase(TestCase):
         with self.assertRaises(CommandError):
             self.sync(csv_text(csv_rows(self.entities())[:20]))
         self.assertEqual(self.member_ids(live), self.all_ids())
+
+    def test_21_has_changes_includes_live_collections(self):
+        self.sync_all()
+        rows = [(t, e.pk, project_uri(e.pk)) for t, e in self.entities()]
+        self.assertFalse(build_plan(DOMAIN, rows).has_changes)
+
+        # uris are in sync, only the newly live collection differs
+        Collection.objects.create(name="live", related_domain=[DOMAIN], live=True)
+        plan = build_plan(DOMAIN, rows)
+        self.assertFalse(plan.to_add or plan.to_change or plan.to_delete)
+        self.assertTrue(plan.has_changes)
 
 
 class LoadCsvTestCase(TestCase):
