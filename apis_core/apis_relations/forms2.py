@@ -97,29 +97,57 @@ class GenericRelationForm(forms.ModelForm):
             x = self.relation_form()
         if f"{site_instance.id}" == f"{cd['target']}":
             return x
-        x.relation_type_id = cd["relation_type"]
         x.start_date_written = cd["start_date_written"]
         x.end_date_written = cd["end_date_written"]
         x.notes = cd["notes"]
         x.references = cd["references"]
-        setattr(x, self.rel_accessor[3], site_instance)
+        site_field, target_field = self._get_side_fields(x, site_instance, instance)
+        x.relation_type_id = cd["relation_type"]
+        setattr(x, site_field, site_instance)
         target = AbstractEntity.get_entity_class_of_name(self.rel_accessor[0])
         t1 = target.get_or_create_uri(cd["target"])
-        setattr(x, self.rel_accessor[2], t1)
+        setattr(x, target_field, t1)
         params = {
-            self.rel_accessor[3]: site_instance,
-            self.rel_accessor[2]: t1,
+            site_field: site_instance,
+            target_field: t1,
             "start_date_written": cd["start_date_written"],
             "end_date_written": cd["end_date_written"],
             "relation_type_id": cd["relation_type"],
         }
         if commit:
-            qs = x.__class__.objects.filter(**params)
-            if qs.count() > 0:
+            # an existing relation must not count as its own duplicate,
+            # otherwise edits of e.g. notes or references are never saved
+            qs = x.__class__.objects.filter(**params).exclude(pk=x.pk)
+            if qs.exists():
                 pass
             else:
                 x.save()
         return x
+
+    def _get_side_fields(self, relation, site_instance, instance):
+        """Returns the names of the fields holding the entity the form is used
+        on and the target entity.
+
+        On save the form is built without the relation instance, so for
+        relations between entities of the same type (e.g. PersonPerson)
+        `rel_accessor` always puts the current entity on side A. When an
+        existing relation is edited from the page of its B entity and its
+        relation type is left unchanged, this would silently swap A and B and
+        thereby reverse the meaning of the relation (see #577). In that case
+        the current entity stays on side B. A newly chosen relation type is
+        picked from the forward labels, so the current entity becomes A."""
+        site_field, target_field = self.rel_accessor[3], self.rel_accessor[2]
+        new_type = f"{self.cleaned_data['relation_type']}"
+        if (
+            instance
+            and site_field.endswith("a")
+            and target_field.endswith("b")
+            and site_field[:-1] == target_field[:-1]
+            and getattr(relation, f"{target_field}_id") == site_instance.id
+            and f"{relation.relation_type_id}" == new_type
+        ):
+            return target_field, site_field
+        return site_field, target_field
 
     def get_text_id(self):
         """
