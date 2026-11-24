@@ -1,7 +1,8 @@
+import json
 import re
 import time
 import unicodedata
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from urllib.parse import quote, urlsplit
 from zoneinfo import ZoneInfo
 
@@ -16,17 +17,19 @@ from AcdhArcheAssets.uri_norm_rules import get_norm_id, get_normalized_uri
 from django.apps import apps
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
+from django.core import serializers
 from django.core.exceptions import ObjectDoesNotExist
-from django.db import models
+from django.db import models, transaction
 from django.db.models.query import QuerySet
 from django.urls import reverse
+from django.utils import timezone
 from django_jsonform.models.fields import ArrayField
 from model_utils.managers import InheritanceManager
 from next_prev import next_in_order, prev_in_order
 from tinymce.models import HTMLField
 
 from apis_core.apis_labels.models import Label
-from apis_core.apis_metainfo.errors import StartDateAfterEndDateError
+from apis_core.apis_metainfo.errors import MergeUndoError, StartDateAfterEndDateError
 from apis_core.apis_vocabularies.models import CollectionType, LabelType, TextType
 from apis_core.helper_functions import DateParser
 
@@ -241,18 +244,64 @@ def absorb_relation(kept, dropped):
         kept.save(parse_dates=False)
 
 
-def move_relation(relation, field, entity):
+def move_relation(relation, field, entity, log=None):
     """Points `field` of `relation` to `entity` (used when merging entities).
     If this turns the relation into an exact duplicate of an existing one, the
     existing relation absorbs it and the duplicate is deleted. Relations which
-    differ e.g. in their dates are kept as separate relations."""
+    differ e.g. in their dates are kept as separate relations.
+
+    If a merge ``log`` dict is given, the move (or the absorption, including a
+    serialized copy of the deleted relation) is recorded so ``MergeLog.undo``
+    can revert it."""
     setattr(relation, field, entity)
     duplicate = find_duplicate_relation(relation)
     if duplicate is None:
         relation.save()
-    else:
-        absorb_relation(duplicate, relation)
-        relation.delete()
+        if log is not None:
+            log["relations"].append(
+                [relation._meta.app_label, relation._meta.model_name, relation.pk, field]
+            )
+        return
+    if log is not None:
+        kept_collections = set(duplicate.collection.values_list("pk", flat=True))
+        kept_texts = set(duplicate.text.values_list("pk", flat=True))
+        record = {
+            # fresh from the database, i.e. still pointing to the merged entity
+            "relation": serialize_entity_for_merge_log(relation),
+            "kept": [duplicate._meta.app_label, duplicate._meta.model_name, duplicate.pk],
+            "uris": list(
+                Uri.objects.filter(entity_id=relation.pk).values_list("id", flat=True)
+            ),
+            "labels": list(
+                Label.objects.filter(temp_entity_id=relation.pk).values_list(
+                    "id", flat=True
+                )
+            ),
+            "kept_added_m2m": {
+                "collection": [
+                    pk
+                    for pk in relation.collection.values_list("pk", flat=True)
+                    if pk not in kept_collections
+                ],
+                "text": [
+                    pk
+                    for pk in relation.text.values_list("pk", flat=True)
+                    if pk not in kept_texts
+                ],
+            },
+            "kept_before": {
+                "notes": duplicate.notes,
+                "references": duplicate.references,
+            },
+        }
+    absorb_relation(duplicate, relation)
+    if log is not None:
+        record["kept_after"] = {
+            "notes": duplicate.notes,
+            "references": duplicate.references,
+        }
+        log["absorbed_relations"].append(record)
+    relation.delete()
 
 
 class TempEntityClass(models.Model):
@@ -571,7 +620,13 @@ class TempEntityClass(models.Model):
         else:
             return None
 
-    def merge_with(self, entities):
+    def merge_with(self, entities, user=None):
+        """Merge ``entities`` into ``self`` and delete them.
+
+        Every merged entity gets a ``MergeLog`` that records the state of the
+        deleted entity and everything that was moved to ``self``, so the merge
+        can be undone (see ``MergeLog.undo``).
+        """
         e_a_pk = self.pk
         e_a = type(self).__name__
         self_model_class = ContentType.objects.get(
@@ -593,9 +648,9 @@ class TempEntityClass(models.Model):
             self_gender = self.gender
         except AttributeError:
             self_gender = False
-        notes = []
-        references = []
         for ent in entities:
+            notes = []
+            references = []
             try:
                 ent_gender = ent.gender
             except AttributeError:
@@ -610,18 +665,36 @@ class TempEntityClass(models.Model):
                 raise ValueError("You can not merge an entity with itself")
             if e_a != e_b:
                 continue
+            log = {
+                "source": serialize_entity_for_merge_log(ent),
+                "target_before": merge_tracked_values(self),
+                "target_added_m2m": {},
+                "uris": list(
+                    Uri.objects.filter(entity=ent).values_list("id", flat=True)
+                ),
+                "labels": list(
+                    Label.objects.filter(temp_entity=ent).values_list("id", flat=True)
+                ),
+                "relations": [],
+                "absorbed_relations": [],
+            }
             lt, _ = LabelType.objects.get_or_create(name="Legacy name (merge)")
             col_list = list(self.collection.all())
             for col2 in ent.collection.all():
                 if col2 not in col_list:
                     self.collection.add(col2)
+                    log["target_added_m2m"].setdefault("collection", []).append(col2.pk)
             for f in ent._meta.local_many_to_many:
                 if not f.name.endswith("_set"):
                     sl = list(getattr(self, f.name).all())
                     for s in getattr(ent, f.name).all():
                         if s not in sl:
                             getattr(self, f.name).add(s)
-            Label.objects.create(label=str(ent), label_type=lt, temp_entity=self)
+                            log["target_added_m2m"].setdefault(f.name, []).append(s.pk)
+            legacy_label = Label.objects.create(
+                label=str(ent), label_type=lt, temp_entity=self
+            )
+            log["legacy_label"] = legacy_label.pk
             for u in Uri.objects.filter(entity=ent):
                 u.entity = self
                 u.save()
@@ -634,24 +707,26 @@ class TempEntityClass(models.Model):
                     q_d = {f"related_{e_b.lower()}a": ent}
                     k = r.model_class().objects.filter(**q_d)
                     for t in k:
-                        move_relation(t, f"related_{e_a.lower()}a", self)
+                        move_relation(t, f"related_{e_a.lower()}a", self, log)
                     q_d = {f"related_{e_b.lower()}b": ent}
                     k = r.model_class().objects.filter(**q_d)
                     for t in k:
-                        move_relation(t, f"related_{e_a.lower()}b", self)
+                        move_relation(t, f"related_{e_a.lower()}b", self, log)
                 else:
                     q_d = {f"related_{e_b.lower()}": ent}
                     k = r.model_class().objects.filter(**q_d)
                     for t in k:
-                        move_relation(t, f"related_{e_a.lower()}", self)
+                        move_relation(t, f"related_{e_a.lower()}", self, log)
+            ent_name = str(ent)[:500]
             ent.delete()
+            save_target = False
             if self_gender:
                 pass
             elif ent_gender:
                 self.gender = ent_gender
+                save_target = True
             else:
                 pass
-            save_target = False
             # Only inherit the lifespan when the target has none at all, and
             # copy both dates together: the merged entity is internally
             # consistent, so this can never produce an invalid date range.
@@ -687,6 +762,252 @@ class TempEntityClass(models.Model):
                 save_target = True
             if save_target:
                 self.save()
+            log["target_after"] = merge_tracked_values(self)
+            MergeLog.objects.create(
+                target=self,
+                target_pk=self.pk,
+                source_pk=e_b_pk,
+                source_model=e_b.lower(),
+                source_name=ent_name,
+                data=log,
+                user=user if user is not None and user.is_authenticated else None,
+            )
+
+
+# Fields of the merge target that ``merge_with`` may change; ``MergeLog`` stores
+# their values before and after the merge so ``undo`` can restore them.
+MERGE_TRACKED_FIELDS = [
+    "notes",
+    "references",
+    "gender",
+    "start_date_written",
+    "end_date_written",
+    "lat",
+    "lng",
+]
+
+
+def merge_tracked_values(entity):
+    return {f: getattr(entity, f) for f in MERGE_TRACKED_FIELDS if hasattr(entity, f)}
+
+
+def serialize_entity_for_merge_log(entity):
+    """Serialize an entity (its TempEntityClass row first, then the concrete
+    row) including its many-to-many values, fresh from the database."""
+    model = type(entity)
+    objects = [TempEntityClass.objects.get(pk=entity.pk)]
+    if model is not TempEntityClass:
+        objects.append(model.objects.get(pk=entity.pk))
+    return json.loads(serializers.serialize("json", objects))
+
+
+def get_merge_undo_days():
+    return getattr(settings, "MERGE_UNDO_DAYS", 14)
+
+
+class MergeLog(models.Model):
+    """Protocol of one merge (``source`` merged into ``target``).
+
+    ``data`` holds a serialized copy of the deleted source entity and the ids
+    of everything that was moved to the target, so the merge can be undone
+    within ``settings.MERGE_UNDO_DAYS`` days.
+    """
+
+    target = models.ForeignKey(
+        TempEntityClass,
+        blank=True,
+        null=True,
+        on_delete=models.SET_NULL,
+        related_name="merge_logs",
+        verbose_name="Ziel",
+    )
+    target_pk = models.PositiveIntegerField(verbose_name="ID des Ziels")
+    source_pk = models.PositiveIntegerField(
+        db_index=True, verbose_name="ID der gemergten Entität"
+    )
+    source_model = models.CharField(max_length=100, verbose_name="Entitätstyp")
+    source_name = models.CharField(
+        max_length=500, blank=True, verbose_name="Name der gemergten Entität"
+    )
+    data = models.JSONField(default=dict)
+    created = models.DateTimeField(auto_now_add=True, verbose_name="gemergt am")
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        blank=True,
+        null=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        verbose_name="gemergt von",
+    )
+    undone_at = models.DateTimeField(
+        blank=True, null=True, verbose_name="rückgängig gemacht am"
+    )
+    undone_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        blank=True,
+        null=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+        verbose_name="rückgängig gemacht von",
+    )
+
+    class Meta:
+        ordering = ["-created"]
+        verbose_name = "Merge-Protokoll"
+        verbose_name_plural = "Merge-Protokolle"
+
+    def __str__(self):
+        return f"{self.source_name} ({self.source_pk}) -> {self.target_pk}"
+
+    @property
+    def undo_deadline(self):
+        return self.created + timedelta(days=get_merge_undo_days())
+
+    def undo_blocker(self):
+        """Reason why this merge can not be undone, or None."""
+        if self.undone_at:
+            return "Diese Zusammenführung wurde bereits rückgängig gemacht."
+        if timezone.now() > self.undo_deadline:
+            return (
+                f"Zusammenführungen können nur {get_merge_undo_days()} Tage "
+                "lang rückgängig gemacht werden."
+            )
+        if not TempEntityClass.objects.filter(pk=self.target_pk).exists():
+            return "Die Ziel-Entität existiert nicht mehr."
+        if TempEntityClass.objects.filter(pk=self.source_pk).exists():
+            return f"Die ID {self.source_pk} ist bereits wieder vergeben."
+        return None
+
+    @property
+    def can_undo(self):
+        return self.undo_blocker() is None
+
+    def undo(self, user=None):
+        """Recreate the merged entity under its old id and move everything
+        that was moved by the merge back to it.
+
+        Returns a list of warnings (things that could not be restored because
+        they changed after the merge).
+        """
+        with transaction.atomic():
+            # lock the row so the same merge can not be undone twice at once
+            log = MergeLog.objects.select_for_update().get(pk=self.pk)
+            blocker = log.undo_blocker()
+            if blocker:
+                raise MergeUndoError(blocker)
+            warnings = []
+            data = log.data
+            source_pk = log.source_pk
+            target_pk = log.target_pk
+
+            # 1. recreate the entity (raw save: no signals, no default uri)
+            for obj in serializers.deserialize("json", json.dumps(data["source"])):
+                obj.save()
+
+            # 2. move uris and labels back
+            moved = Uri.objects.filter(id__in=data["uris"], entity_id=target_pk)
+            if moved.count() != len(data["uris"]):
+                warnings.append(
+                    f"{len(data['uris']) - moved.count()} URI(s) waren nicht mehr "
+                    "beim Ziel und wurden nicht zurückverschoben."
+                )
+            moved.update(entity_id=source_pk)
+            moved = Label.objects.filter(
+                id__in=data["labels"], temp_entity_id=target_pk
+            )
+            if moved.count() != len(data["labels"]):
+                warnings.append(
+                    f"{len(data['labels']) - moved.count()} Label waren nicht mehr "
+                    "beim Ziel und wurden nicht zurückverschoben."
+                )
+            moved.update(temp_entity_id=source_pk)
+            if data.get("legacy_label"):
+                Label.objects.filter(
+                    id=data["legacy_label"], temp_entity_id=target_pk
+                ).delete()
+
+            # 3a. recreate relations that were absorbed by an identical relation
+            # of the target (before 3b: a self relation may have one side
+            # logged as moved and then been absorbed via its other side)
+            for record in data.get("absorbed_relations", []):
+                for obj in serializers.deserialize(
+                    "json", json.dumps(record["relation"])
+                ):
+                    obj.save()
+                rel_pk = record["relation"][0]["pk"]
+                app_label, model_name, kept_pk = record["kept"]
+                Uri.objects.filter(id__in=record["uris"], entity_id=kept_pk).update(
+                    entity_id=rel_pk
+                )
+                Label.objects.filter(
+                    id__in=record["labels"], temp_entity_id=kept_pk
+                ).update(temp_entity_id=rel_pk)
+                kept = (
+                    ContentType.objects.get(app_label=app_label, model=model_name)
+                    .model_class()
+                    .objects.filter(pk=kept_pk)
+                    .first()
+                )
+                if kept is None:
+                    continue
+                for field_name, pks in record["kept_added_m2m"].items():
+                    if pks:
+                        getattr(kept, field_name).remove(*pks)
+                kept_changed = False
+                for field, before in record["kept_before"].items():
+                    after = record["kept_after"][field]
+                    if getattr(kept, field) == after and after != before:
+                        setattr(kept, field, before)
+                        kept_changed = True
+                if kept_changed:
+                    kept.save(parse_dates=False)
+
+            # 3b. move relations back
+            missing = 0
+            for app_label, model_name, rel_pk, field in data["relations"]:
+                model_class = ContentType.objects.get(
+                    app_label=app_label, model=model_name
+                ).model_class()
+                updated = model_class.objects.filter(
+                    pk=rel_pk, **{f"{field}_id": target_pk}
+                ).update(**{f"{field}_id": source_pk})
+                if not updated:
+                    missing += 1
+            if missing:
+                warnings.append(
+                    f"{missing} Beziehung(en) wurden seit der Zusammenführung "
+                    "gelöscht oder geändert und nicht zurückverschoben."
+                )
+
+            # 4. remove what the merge added to the target
+            target_model = ContentType.objects.get(
+                app_label="apis_entities", model=log.source_model
+            ).model_class()
+            target = target_model.objects.get(pk=target_pk)
+            for field_name, pks in data["target_added_m2m"].items():
+                getattr(target, field_name).remove(*pks)
+
+            # 5. restore target fields, but only those unchanged since the merge
+            changed = False
+            for field, before in data["target_before"].items():
+                after = data["target_after"].get(field)
+                current = getattr(target, field)
+                if current == after:
+                    if current != before:
+                        setattr(target, field, before)
+                        changed = True
+                elif before != after:
+                    warnings.append(
+                        f"Das Feld '{field}' der Ziel-Entität wurde seit der "
+                        "Zusammenführung geändert und nicht zurückgesetzt."
+                    )
+            if changed:
+                target.save()
+
+            log.undone_at = timezone.now()
+            log.undone_by = user if user is not None and user.is_authenticated else None
+            log.save()
+        return warnings
 
 
 class Source(models.Model):
@@ -839,6 +1160,17 @@ class Collection(models.Model):
         verbose_name="veröffentlicht",
         help_text="Auf 'True' setzen damit das Projekt unter 'projects' aufscheint.",
     )
+    live = models.BooleanField(
+        default=False,
+        verbose_name="live",
+        help_text=(
+            "Auf 'True' setzen, damit die Sammlung bei jedem automatischen "
+            "URI-Abgleich (sync_uris_in_use) einer der verknüpften Domains "
+            "aktualisiert wird: Sie enthält dann genau die Entitäten mit einer URI "
+            "dieser Domains. Manuell zugeordnete Entitäten ohne passende URI werden "
+            "dabei entfernt."
+        ),
+    )
 
     class Meta:
         ordering = ["name"]
@@ -866,3 +1198,27 @@ class Collection(models.Model):
 
     def get_related_entities_count(self):
         return self.get_related_entities().count()
+
+    def get_member_ids(self):
+        """Ids of the entities assigned to this collection (not derived from uris)."""
+        through = TempEntityClass.collection.through
+        return set(
+            through.objects.filter(collection_id=self.pk).values_list(
+                "tempentityclass_id", flat=True
+            )
+        )
+
+    def sync_members(self, to_add, to_remove, batch_size=5000):
+        """Adds and removes entities (ids) without touching other collections."""
+        through = TempEntityClass.collection.through
+        to_remove = list(to_remove)
+        for i in range(0, len(to_remove), batch_size):
+            through.objects.filter(
+                collection_id=self.pk,
+                tempentityclass_id__in=to_remove[i : i + batch_size],
+            ).delete()
+        through.objects.bulk_create(
+            [through(collection_id=self.pk, tempentityclass_id=e) for e in to_add],
+            batch_size=batch_size,
+            ignore_conflicts=True,
+        )
