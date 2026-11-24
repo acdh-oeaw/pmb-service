@@ -35,6 +35,7 @@ from apis_core.helper_functions import DateParser
 
 DOMAIN_MAPPING = settings.DOMAIN_MAPPING
 DEFAULT_COLOR = settings.DEFAULT_COLOR
+PMB_URI_NUMBER_RE = re.compile(r"/entity/(\d+)/?$")
 DATE_ORDER_VALIDATION_MESSAGE = (
     "Das End-Datum muss gleich oder später als das Start-Datum sein."
 )
@@ -182,6 +183,127 @@ def to_iso_like(value: str) -> str:
     return value
 
 
+def _written_date_q(field, value):
+    """Matches a written date; an empty string and NULL count as the same date."""
+    if value:
+        return models.Q(**{field: value})
+    return models.Q(**{f"{field}__isnull": True}) | models.Q(**{field: ""})
+
+
+def find_duplicate_relation(relation):
+    """Returns another relation which is identical to `relation`: same relation
+    class, same entities on the same sides, same relation type and same written
+    start and end date. Returns None if there is no such relation."""
+    field_a = relation.get_related_entity_field_namea()
+    field_b = relation.get_related_entity_field_nameb()
+    return (
+        type(relation)
+        .objects.filter(
+            _written_date_q("start_date_written", relation.start_date_written),
+            _written_date_q("end_date_written", relation.end_date_written),
+            **{
+                f"{field_a}_id": getattr(relation, f"{field_a}_id"),
+                f"{field_b}_id": getattr(relation, f"{field_b}_id"),
+                "relation_type_id": relation.relation_type_id,
+            },
+        )
+        .exclude(pk=relation.pk)
+        .order_by("pk")
+        .first()
+    )
+
+
+def _append_text(kept, dropped):
+    """Appends `dropped` to `kept` unless it is empty or already contained."""
+    kept = kept or ""
+    dropped = (dropped or "").strip()
+    if not dropped or dropped in kept:
+        return kept
+    return f"{kept} {dropped}".strip()
+
+
+def absorb_relation(kept, dropped):
+    """Copies what `dropped` holds beyond `kept` (collections, texts, uris,
+    labels, notes and references) onto `kept`, so `dropped` can be deleted
+    without losing information."""
+    kept_collections = set(kept.collection.all())
+    for col in dropped.collection.all():
+        if col not in kept_collections:
+            kept.collection.add(col)
+    kept_texts = set(kept.text.all())
+    for text in dropped.text.all():
+        if text not in kept_texts:
+            kept.text.add(text)
+    Uri.objects.filter(entity_id=dropped.pk).update(entity_id=kept.pk)
+    Label.objects.filter(temp_entity_id=dropped.pk).update(temp_entity_id=kept.pk)
+    notes = _append_text(kept.notes, dropped.notes)
+    references = _append_text(kept.references, dropped.references)
+    if notes != (kept.notes or "") or references != (kept.references or ""):
+        kept.notes = notes
+        kept.references = references
+        kept.save(parse_dates=False)
+
+
+def move_relation(relation, field, entity, log=None):
+    """Points `field` of `relation` to `entity` (used when merging entities).
+    If this turns the relation into an exact duplicate of an existing one, the
+    existing relation absorbs it and the duplicate is deleted. Relations which
+    differ e.g. in their dates are kept as separate relations.
+
+    If a merge ``log`` dict is given, the move (or the absorption, including a
+    serialized copy of the deleted relation) is recorded so ``MergeLog.undo``
+    can revert it."""
+    setattr(relation, field, entity)
+    duplicate = find_duplicate_relation(relation)
+    if duplicate is None:
+        relation.save()
+        if log is not None:
+            log["relations"].append(
+                [relation._meta.app_label, relation._meta.model_name, relation.pk, field]
+            )
+        return
+    if log is not None:
+        kept_collections = set(duplicate.collection.values_list("pk", flat=True))
+        kept_texts = set(duplicate.text.values_list("pk", flat=True))
+        record = {
+            # fresh from the database, i.e. still pointing to the merged entity
+            "relation": serialize_entity_for_merge_log(relation),
+            "kept": [duplicate._meta.app_label, duplicate._meta.model_name, duplicate.pk],
+            "uris": list(
+                Uri.objects.filter(entity_id=relation.pk).values_list("id", flat=True)
+            ),
+            "labels": list(
+                Label.objects.filter(temp_entity_id=relation.pk).values_list(
+                    "id", flat=True
+                )
+            ),
+            "kept_added_m2m": {
+                "collection": [
+                    pk
+                    for pk in relation.collection.values_list("pk", flat=True)
+                    if pk not in kept_collections
+                ],
+                "text": [
+                    pk
+                    for pk in relation.text.values_list("pk", flat=True)
+                    if pk not in kept_texts
+                ],
+            },
+            "kept_before": {
+                "notes": duplicate.notes,
+                "references": duplicate.references,
+            },
+        }
+    absorb_relation(duplicate, relation)
+    if log is not None:
+        record["kept_after"] = {
+            "notes": duplicate.notes,
+            "references": duplicate.references,
+        }
+        log["absorbed_relations"].append(record)
+    relation.delete()
+
+
 class TempEntityClass(models.Model):
     """Base class to bind common attributes to many classes.
 
@@ -251,6 +373,29 @@ class TempEntityClass(models.Model):
             return f"{self.name} (ID: {self.id})"
         else:
             return f"(ID: {self.id})"
+
+    def get_sorted_uris(self):
+        """URIs in stabiler Reihenfolge für Exporte (TEI).
+
+        1. die PMB-URI, die der aktuellen ID entspricht,
+        2. weitere PMB-URIs (z.B. aus Merges) aufsteigend nach Nummer,
+        3. alle übrigen URIs in Anlage-Reihenfolge (pk).
+        """
+        own, other_pmb, rest = [], [], []
+        for uri in sorted(self.uri_set.all(), key=lambda u: u.pk):
+            number = None
+            if uri.domain == "pmb" and uri.uri:
+                match = PMB_URI_NUMBER_RE.search(uri.uri)
+                if match:
+                    number = int(match.group(1))
+            if number is None:
+                rest.append(uri)
+            elif number == self.pk:
+                own.append(uri)
+            else:
+                other_pmb.append((number, uri))
+        other_pmb.sort(key=lambda x: x[0])
+        return own + [u for _, u in other_pmb] + rest
 
     def save(self, parse_dates=True, *args, **kwargs):
         """Adaption of the save() method of the class to automatically parse string-dates into date objects"""
@@ -531,6 +676,7 @@ class TempEntityClass(models.Model):
                     Label.objects.filter(temp_entity=ent).values_list("id", flat=True)
                 ),
                 "relations": [],
+                "absorbed_relations": [],
             }
             lt, _ = LabelType.objects.get_or_create(name="Legacy name (merge)")
             col_list = list(self.collection.all())
@@ -561,28 +707,16 @@ class TempEntityClass(models.Model):
                     q_d = {f"related_{e_b.lower()}a": ent}
                     k = r.model_class().objects.filter(**q_d)
                     for t in k:
-                        setattr(t, f"related_{e_a.lower()}a", self)
-                        t.save()
-                        log["relations"].append(
-                            [r.app_label, r.model, t.pk, f"related_{e_a.lower()}a"]
-                        )
+                        move_relation(t, f"related_{e_a.lower()}a", self, log)
                     q_d = {f"related_{e_b.lower()}b": ent}
                     k = r.model_class().objects.filter(**q_d)
                     for t in k:
-                        setattr(t, f"related_{e_a.lower()}b", self)
-                        t.save()
-                        log["relations"].append(
-                            [r.app_label, r.model, t.pk, f"related_{e_a.lower()}b"]
-                        )
+                        move_relation(t, f"related_{e_a.lower()}b", self, log)
                 else:
                     q_d = {f"related_{e_b.lower()}": ent}
                     k = r.model_class().objects.filter(**q_d)
                     for t in k:
-                        setattr(t, f"related_{e_a.lower()}", self)
-                        t.save()
-                        log["relations"].append(
-                            [r.app_label, r.model, t.pk, f"related_{e_a.lower()}"]
-                        )
+                        move_relation(t, f"related_{e_a.lower()}", self, log)
             ent_name = str(ent)[:500]
             ent.delete()
             save_target = False
@@ -792,7 +926,43 @@ class MergeLog(models.Model):
                     id=data["legacy_label"], temp_entity_id=target_pk
                 ).delete()
 
-            # 3. move relations back
+            # 3a. recreate relations that were absorbed by an identical relation
+            # of the target (before 3b: a self relation may have one side
+            # logged as moved and then been absorbed via its other side)
+            for record in data.get("absorbed_relations", []):
+                for obj in serializers.deserialize(
+                    "json", json.dumps(record["relation"])
+                ):
+                    obj.save()
+                rel_pk = record["relation"][0]["pk"]
+                app_label, model_name, kept_pk = record["kept"]
+                Uri.objects.filter(id__in=record["uris"], entity_id=kept_pk).update(
+                    entity_id=rel_pk
+                )
+                Label.objects.filter(
+                    id__in=record["labels"], temp_entity_id=kept_pk
+                ).update(temp_entity_id=rel_pk)
+                kept = (
+                    ContentType.objects.get(app_label=app_label, model=model_name)
+                    .model_class()
+                    .objects.filter(pk=kept_pk)
+                    .first()
+                )
+                if kept is None:
+                    continue
+                for field_name, pks in record["kept_added_m2m"].items():
+                    if pks:
+                        getattr(kept, field_name).remove(*pks)
+                kept_changed = False
+                for field, before in record["kept_before"].items():
+                    after = record["kept_after"][field]
+                    if getattr(kept, field) == after and after != before:
+                        setattr(kept, field, before)
+                        kept_changed = True
+                if kept_changed:
+                    kept.save(parse_dates=False)
+
+            # 3b. move relations back
             missing = 0
             for app_label, model_name, rel_pk, field in data["relations"]:
                 model_class = ContentType.objects.get(
@@ -908,6 +1078,17 @@ class Uri(models.Model):
                 color = x[2]
                 break
         return color
+
+    def get_link_url(self):
+        """URL used for links in the web interface.
+
+        ANNO (anno.onb.ac.at) blocks URIs with a fragment, so for ANNO URIs
+        everything from "#" on is cut off (the stored URI stays unchanged).
+        """
+        uri = str(self.uri or "")
+        if "#" in uri and urlsplit(uri).hostname == "anno.onb.ac.at":
+            return uri.split("#", 1)[0]
+        return uri
 
     def get_web_object(self):
         result = {

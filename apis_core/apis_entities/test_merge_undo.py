@@ -214,6 +214,8 @@ class MergeUndoTestCase(TestCase):
             related_persona=self.source,
             related_personb=self.other,
             relation_type=self.rel_pp.relation_type,
+            # a date, so the relation is no duplicate of rel_target after merging
+            start_date_written="1900",
         )
         log = self.merge()
         rel.refresh_from_db()
@@ -285,3 +287,34 @@ class MergeUndoTestCase(TestCase):
         url = reverse("apis:apis_entities:undo_merge_view", kwargs={"pk": log.pk})
         r = self.client.post(url, follow=True)
         self.assertContains(r, "nicht zurückverschoben")
+
+    def test_undo_restores_absorbed_duplicate_relation(self):
+        kept = PersonPlace.objects.create(
+            related_person=self.target,
+            related_place=self.place,
+            relation_type=self.rel_pl.relation_type,
+            notes="kept notes",
+        )
+        rel_col = Collection.objects.create(name="Relationen")
+        self.rel_pl.collection.add(rel_col)
+        self.rel_pl.notes = "dropped notes"
+        self.rel_pl.save()
+        rel_uri = Uri.objects.create(
+            uri="https://example.org/rel/1", domain="example", entity=self.rel_pl
+        )
+        dropped_pk = self.rel_pl.pk
+        log = self.merge()
+        self.assertFalse(PersonPlace.objects.filter(pk=dropped_pk).exists())
+        kept.refresh_from_db()
+        self.assertIn(rel_col, kept.collection.all())
+        self.assertEqual(kept.notes, "kept notes dropped notes")
+        self.assertEqual(log.undo(), [])
+        restored = PersonPlace.objects.get(pk=dropped_pk)
+        self.assertEqual(restored.related_person_id, self.source_pk)
+        self.assertEqual(restored.notes, "dropped notes")
+        self.assertIn(rel_col, restored.collection.all())
+        rel_uri.refresh_from_db()
+        self.assertEqual(rel_uri.entity_id, dropped_pk)
+        kept.refresh_from_db()
+        self.assertEqual(kept.notes, "kept notes")
+        self.assertNotIn(rel_col, kept.collection.all())

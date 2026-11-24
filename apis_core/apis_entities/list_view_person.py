@@ -37,16 +37,16 @@ excluded_cols = [
 ]
 
 PERSON_PERSON_RELATION_CHOICES = [
-    (f"{x.id}", f"{x} (ID: {x.id})") for x in PersonPersonRelation.objects.all()
+    (f"{x.id}", f"{x} (ID: {x.id})") for x in PersonPersonRelation.objects.only("id", "name")
 ]
 PERSON_PLACE_RELATION_CHOICES = [
-    (f"{x.id}", f"{x} (ID: {x.id})") for x in PersonPlaceRelation.objects.all()
+    (f"{x.id}", f"{x} (ID: {x.id})") for x in PersonPlaceRelation.objects.only("id", "name")
 ]
 PERSON_WORK_RELATION_CHOICES = [
-    (f"{x.id}", f"{x} (ID: {x.id})") for x in PersonWorkRelation.objects.all()
+    (f"{x.id}", f"{x} (ID: {x.id})") for x in PersonWorkRelation.objects.only("id", "name")
 ]
 PERSON_INSTITUTION_RELATION_CHOICES = [
-    (f"{x.id}", f"{x} (ID: {x.id})") for x in PersonInstitutionRelation.objects.all()
+    (f"{x.id}", f"{x} (ID: {x.id})") for x in PersonInstitutionRelation.objects.only("id", "name")
 ]
 
 
@@ -74,7 +74,8 @@ class PersonListFilter(MyBaseFilter):
     first_name = django_filters.CharFilter(
         lookup_expr="icontains",
         label="Vorname",
-        help_text="eingegebene Zeichenkette muss im Vornamen enthalten sein",
+        method="first_name_label_filter",
+        help_text="eingegebene Zeichenkette muss im Vornamen oder in einem Label enthalten sein, dessen Label-Typ 'Vorname' enthält",
     )
     profession = django_filters.ModelMultipleChoiceFilter(
         queryset=ProfessionType.objects.all(),
@@ -109,6 +110,17 @@ class PersonListFilter(MyBaseFilter):
         method="related_institution_filter",
     )
     collection = django_filters.ModelChoiceFilter(queryset=Collection.objects.all())
+
+    def first_name_label_filter(self, queryset, name, value):
+        lookup, value = self.construct_lookup(value)
+        queryset_first_name = queryset.filter(**{name + lookup: value})
+        queryset_first_name_label = queryset.filter(
+            **{
+                "label__label_type__name__icontains": "vorname",
+                "label__label" + lookup: value,
+            }
+        )
+        return (queryset_first_name | queryset_first_name_label).distinct()
 
     def related_work_filter(self, qs, name, value):
         rels = get_child_classes(
