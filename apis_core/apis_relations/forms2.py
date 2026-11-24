@@ -20,6 +20,10 @@ from apis_core.apis_metainfo.models import (
     to_iso_like,
 )
 from apis_core.apis_relations.models import AbstractRelation
+from apis_core.apis_vocabularies.direction import (
+    directed_relation_type_value,
+    split_directed_relation_type,
+)
 from apis_core.helper_functions import DateParser
 
 from .tables import get_generic_relations_table
@@ -67,6 +71,14 @@ class GenericRelationForm(forms.ModelForm):
         value = self.cleaned_data.get("target")
         return normalize_target_autocomplete_value(value)
 
+    def clean_relation_type(self):
+        value = self.cleaned_data.get("relation_type")
+        type_id, reverse = split_directed_relation_type(value)
+        if reverse and not self.same_entity_class:
+            raise ValidationError("Ungültige Art der Beziehung.", code="invalid")
+        self.reverse_direction = reverse
+        return type_id
+
     def clean(self):
         cleaned_data = super().clean()
         start_date_written = cleaned_data.get("start_date_written")
@@ -97,12 +109,20 @@ class GenericRelationForm(forms.ModelForm):
             x = self.relation_form()
         if f"{site_instance.id}" == f"{cd['target']}":
             return x
+        x.relation_type_id = cd["relation_type"]
         x.start_date_written = cd["start_date_written"]
         x.end_date_written = cd["end_date_written"]
         x.notes = cd["notes"]
         x.references = cd["references"]
-        site_field, target_field = self._get_side_fields(x, site_instance, instance)
-        x.relation_type_id = cd["relation_type"]
+        site_field, target_field = self.rel_accessor[3], self.rel_accessor[2]
+        if self.same_entity_class:
+            # the chosen reading decides whether the current entity is source or target
+            field_a = self.relation_form.get_related_entity_field_namea()
+            field_b = self.relation_form.get_related_entity_field_nameb()
+            if self.reverse_direction:
+                site_field, target_field = field_b, field_a
+            else:
+                site_field, target_field = field_a, field_b
         setattr(x, site_field, site_instance)
         target = AbstractEntity.get_entity_class_of_name(self.rel_accessor[0])
         t1 = target.get_or_create_uri(cd["target"])
@@ -123,31 +143,6 @@ class GenericRelationForm(forms.ModelForm):
             else:
                 x.save()
         return x
-
-    def _get_side_fields(self, relation, site_instance, instance):
-        """Returns the names of the fields holding the entity the form is used
-        on and the target entity.
-
-        On save the form is built without the relation instance, so for
-        relations between entities of the same type (e.g. PersonPerson)
-        `rel_accessor` always puts the current entity on side A. When an
-        existing relation is edited from the page of its B entity and its
-        relation type is left unchanged, this would silently swap A and B and
-        thereby reverse the meaning of the relation (see #577). In that case
-        the current entity stays on side B. A newly chosen relation type is
-        picked from the forward labels, so the current entity becomes A."""
-        site_field, target_field = self.rel_accessor[3], self.rel_accessor[2]
-        new_type = f"{self.cleaned_data['relation_type']}"
-        if (
-            instance
-            and site_field.endswith("a")
-            and target_field.endswith("b")
-            and site_field[:-1] == target_field[:-1]
-            and getattr(relation, f"{target_field}_id") == site_instance.id
-            and f"{relation.relation_type_id}" == new_type
-        ):
-            return target_field, site_field
-        return site_field, target_field
 
     def get_text_id(self):
         """
@@ -225,7 +220,9 @@ class GenericRelationForm(forms.ModelForm):
         self.helper.form_class = f"{self.relation_form!s}Form"
         self.helper.form_tag = False
         lst_src_target = re.findall("[A-Z][^A-Z]*", self.relation_form.__name__)
-        if lst_src_target[0] == lst_src_target[1]:
+        self.same_entity_class = lst_src_target[0] == lst_src_target[1]
+        self.reverse_direction = False
+        if self.same_entity_class:
             if instance and instance.id:
                 if getattr(
                     instance, f"related_{lst_src_target[0].lower()}a_id"
@@ -263,7 +260,7 @@ class GenericRelationForm(forms.ModelForm):
                                     "relation",
                                 ]
                             ),
-                            "normal",
+                            "both",
                         ],
                     ),
                     attrs=attrs,
@@ -388,11 +385,15 @@ class GenericRelationForm(forms.ModelForm):
                     instance.relation_type.label,
                 )
             else:
+                # same entity class: the current entity is the target, mark the reading as reversed
+                value = directed_relation_type_value(
+                    instance.relation_type.id, reverse=self.same_entity_class
+                )
                 self.fields["relation_type"].choices = [
-                    (instance.relation_type.id, instance.relation_type.label_reverse)
+                    (value, instance.relation_type.label_reverse)
                 ]
                 self.fields["relation_type"].initial = (
-                    instance.relation_type.id,
+                    value,
                     instance.relation_type.label_reverse,
                 )
 
