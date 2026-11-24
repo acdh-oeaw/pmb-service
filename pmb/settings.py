@@ -172,6 +172,8 @@ PROJECT_NAME = "pmb"
 APIS_BASE_URI = "https://pmb.acdh.oeaw.ac.at/"
 
 REDMINE_ID = "20586"
+ACDH_IMPRINT_URL = "https://imprint.acdh.oeaw.ac.at/"
+
 APIS_RELATIONS_FILTER_EXCLUDE = []
 CSRF_TRUSTED_ORIGINS = ["https://pmb.acdh.oeaw.ac.at"]
 BIRTH_REL = [
