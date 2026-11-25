@@ -1,10 +1,13 @@
 from django.core.exceptions import ValidationError
 from django.test import TestCase
 
+from apis_core.apis_entities.models import Person
 from apis_core.apis_relations.forms2 import (
     GenericRelationForm,
     normalize_target_autocomplete_value,
 )
+from apis_core.apis_relations.models import PersonPerson
+from apis_core.apis_vocabularies.models import PersonPersonRelation
 
 
 class GenericRelationFormTestCase(TestCase):
@@ -86,6 +89,109 @@ class GenericRelationFormTestCase(TestCase):
 
                 self.assertTrue(form.is_valid(), msg=form.errors.as_json())
                 self.assertEqual(form.cleaned_data["target"], "44909")
+
+
+class SameEntityRelationDirectionTestCase(TestCase):
+    """Editing a relation between two entities of the same type must not swap
+    its sides (and thereby reverse its meaning), no matter from which entity's
+    page it is edited (see #577)."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.father = Person.objects.create(name="Vater")
+        cls.son = Person.objects.create(name="Sohn")
+        cls.is_father_of = PersonPersonRelation.objects.create(
+            name="ist Vater von", name_reverse="ist Sohn von"
+        )
+        cls.knows = PersonPersonRelation.objects.create(
+            name="kennt", name_reverse="kennt"
+        )
+
+    def _submit(self, site, target, relation_type, relation=None, notes="edited"):
+        # mirrors save_ajax_form: the form is built without the instance
+        form = GenericRelationForm(
+            entity_type=Person,
+            relation_form="PersonPerson",
+            data={
+                "relation_type": relation_type,
+                "target": f"{target.id}",
+                "start_date_written": "",
+                "end_date_written": "",
+                "references": "",
+                "notes": notes,
+            },
+        )
+        self.assertTrue(form.is_valid(), msg=form.errors.as_json())
+        saved = form.save(
+            site_instance=site, instance=relation.pk if relation else None
+        )
+        if relation:
+            relation.refresh_from_db()
+        return saved
+
+    def _preselected_type(self, relation, site):
+        # mirrors get_form_ajax: the value the edit form submits if left untouched
+        form = GenericRelationForm(
+            entity_type=Person,
+            relation_form="PersonPerson",
+            instance=relation,
+            siteID=site.pk,
+        )
+        return f"{form.fields['relation_type'].initial[0]}"
+
+    def _relation(self, relation_type=None):
+        return PersonPerson.objects.create(
+            related_persona=self.father,
+            related_personb=self.son,
+            relation_type=relation_type or self.is_father_of,
+        )
+
+    def _assert_sides(self, relation, a, b, relation_type):
+        self.assertEqual(relation.related_persona, a)
+        self.assertEqual(relation.related_personb, b)
+        self.assertEqual(relation.relation_type, relation_type)
+
+    def test_edit_from_a_side_keeps_direction(self):
+        rel = self._relation()
+        value = self._preselected_type(rel, self.father)
+        self._submit(self.father, self.son, value, rel)
+        self._assert_sides(rel, self.father, self.son, self.is_father_of)
+        self.assertEqual(rel.notes, "edited")
+
+    def test_edit_from_b_side_keeps_direction(self):
+        rel = self._relation()
+        value = self._preselected_type(rel, self.son)
+        self._submit(self.son, self.father, value, rel)
+        self._assert_sides(rel, self.father, self.son, self.is_father_of)
+        self.assertEqual(rel.notes, "edited")
+
+    def test_edit_symmetric_type_from_b_side_keeps_direction(self):
+        rel = self._relation(self.knows)
+        value = self._preselected_type(rel, self.son)
+        self._submit(self.son, self.father, value, rel)
+        self._assert_sides(rel, self.father, self.son, self.knows)
+        self.assertEqual(rel.notes, "edited")
+
+    def test_forward_reading_from_b_side_reverses_direction(self):
+        # deliberately picking the other reading of the same type is respected
+        rel = self._relation()
+        self._submit(self.son, self.father, f"{self.is_father_of.id}", rel)
+        self._assert_sides(rel, self.son, self.father, self.is_father_of)
+
+    def test_new_type_from_b_side_puts_current_entity_on_a(self):
+        rel = self._relation()
+        self._submit(self.son, self.father, f"{self.knows.id}", rel)
+        self._assert_sides(rel, self.son, self.father, self.knows)
+
+    def test_new_relation_puts_current_entity_on_a(self):
+        rel = self._submit(self.father, self.son, f"{self.is_father_of.id}")
+        rel.refresh_from_db()
+        self._assert_sides(rel, self.father, self.son, self.is_father_of)
+
+    def test_new_duplicate_is_not_saved(self):
+        self._relation()
+        self._submit(self.father, self.son, f"{self.is_father_of.id}")
+        self.assertEqual(PersonPerson.objects.count(), 1)
 
 
 class InverseRelationTypeTestCase(TestCase):

@@ -135,8 +135,10 @@ class GenericRelationForm(forms.ModelForm):
             "relation_type_id": cd["relation_type"],
         }
         if commit:
-            qs = x.__class__.objects.filter(**params)
-            if qs.count() > 0:
+            # an existing relation must not count as its own duplicate,
+            # otherwise edits of e.g. notes or references are never saved
+            qs = x.__class__.objects.filter(**params).exclude(pk=x.pk)
+            if qs.exists():
                 pass
             else:
                 x.save()
